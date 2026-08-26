@@ -1,88 +1,79 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import OpenAI from "openai";
-
-dotenv.config();
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
 
 const app = express();
-app.use(cors());
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 5 } });
+app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const PORT = process.env.PORT || 5000;
+app.get("/api/healthz", (req,res)=>res.json({ok:true, service:"Arbaj AI Backend"}));
 
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, message: "AI backend is running" });
-});
+function aiConfig(){
+  return {
+    url: process.env.AI_API_URL,
+    key: process.env.AI_API_KEY,
+    model: process.env.AI_MODEL || "gpt-4o-mini"
+  };
+}
 
-app.post("/api/chat", async (req, res) => {
-  try {
-    const { message, useWeb = false } = req.body;
-    if (!message?.trim()) return res.status(400).json({ error: "Message is required" });
-
-    const tools = useWeb ? [{ type: "web_search_preview" }] : undefined;
-
-    const response = await client.responses.create({
-      model: "gpt-5-mini",
-      input: message,
-      tools
-    });
-
-    res.json({ text: response.output_text || "No response generated." });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error?.message || "AI request failed" });
-  }
-});
-
-app.post("/api/image", async (req, res) => {
-  try {
-    const { prompt } = req.body;
-    if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
-
-    const result = await client.images.generate({
-      model: "gpt-image-1",
-      prompt,
-      size: "1024x1024"
-    });
-
-    const item = result.data?.[0];
-    if (!item) throw new Error("No image returned");
-
-    if (item.b64_json) {
-      return res.json({ image: `data:image/png;base64,${item.b64_json}` });
+function extractText(files=[]){
+  return files.map(f=>{
+    const type=(f.mimetype||"").toLowerCase();
+    if(type.startsWith("text/") || /csv|json/.test(type)) {
+      return `\n\n[File: ${f.originalname}]\n${f.buffer.toString("utf8").slice(0,120000)}`;
     }
-    res.json({ image: item.url });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error?.message || "Image generation failed" });
-  }
+    return `\n\n[Attached file: ${f.originalname}, type: ${f.mimetype}, size: ${f.size} bytes]`;
+  }).join("");
+}
+
+async function askAI(message, files=[]){
+  const {url,key,model}=aiConfig();
+  if(!url || !key) throw Object.assign(new Error("AI backend is not configured. Set AI_API_URL, AI_API_KEY and AI_MODEL."),{status:503});
+  const attachmentText=extractText(files);
+  const r=await fetch(url,{
+    method:"POST",
+    headers:{"Content-Type":"application/json","Authorization":`Bearer ${key}`},
+    body:JSON.stringify({
+      model,
+      messages:[
+        {role:"system",content:"You are Arbaj AI. Be helpful, clear and answer in the user's language when possible."},
+        {role:"user",content:message + attachmentText}
+      ]
+    })
+  });
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok) throw Object.assign(new Error(data?.error?.message || data?.error || "AI provider error"),{status:r.status});
+  return data?.choices?.[0]?.message?.content || data?.output_text || data?.reply || data?.answer || "No response returned.";
+}
+
+app.post("/api/chat", upload.array("files",5), async (req,res)=>{
+  const message=String(req.body?.message || req.body?.question || "").trim();
+  if(!message && !(req.files||[]).length) return res.status(400).json({error:"message or file is required"});
+  try{
+    const reply=await askAI(message || "Please analyze the attached files.",req.files||[]);
+    res.json({reply});
+  }catch(err){res.status(err.status||500).json({error:err.message});}
 });
 
-app.post("/api/website", async (req, res) => {
-  try {
-    const { prompt } = req.body;
-    if (!prompt?.trim()) return res.status(400).json({ error: "Website request is required" });
-
-    const response = await client.responses.create({
-      model: "gpt-5-mini",
-      input: `You are an expert web developer. Build a complete single-file website from this request:
-${prompt}
-
-Return ONLY valid HTML. Include CSS and JavaScript inside the same HTML file. Make it responsive, polished, accessible, and functional. Do not use markdown fences.`
-    });
-
-    let html = response.output_text || "";
-    html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-
-    res.json({ html });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error?.message || "Website generation failed" });
-  }
+app.post("/api/generate-image", async (req,res)=>{
+  const prompt=String(req.body?.prompt || "").trim();
+  if(!prompt) return res.status(400).json({error:"prompt is required"});
+  const url=process.env.IMAGE_API_URL;
+  const key=process.env.IMAGE_API_KEY;
+  const model=process.env.IMAGE_MODEL || "gpt-image-1";
+  if(!url || !key) return res.status(503).json({error:"Image generation is not configured. Set IMAGE_API_URL, IMAGE_API_KEY and IMAGE_MODEL."});
+  try{
+    const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${key}`},body:JSON.stringify({model,prompt,n:1,size:"1024x1024"})});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok) return res.status(r.status).json({error:data?.error?.message || data?.error || "Image provider error"});
+    const item=data?.data?.[0] || {};
+    const image=item.url || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : null);
+    if(!image) return res.status(502).json({error:"Provider returned no image"});
+    res.json({url:image});
+  }catch(err){res.status(500).json({error:err.message});}
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend running on http://localhost:${PORT}`);
-});
+const port=process.env.PORT || 3000;
+app.listen(port,()=>console.log(`Arbaj AI backend running on ${port}`));
